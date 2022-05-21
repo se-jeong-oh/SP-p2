@@ -80,13 +80,14 @@ void parseline(char *cmdline, char *argv[]) {
     }
     return;
 }
-void eval(char *argv[], char buf[], int connfd) {
-    int ID, amount;
-    char *msg = (char *)malloc(sizeof(char)*MAXLINE);
+void eval(char *argv[], char buf[], int connfd, pool* p) {
+    int ID, amount, i;
+    char *msg = (char *)calloc(MAXLINE,sizeof(char));
     Tree *curr_node;
     //printf("argv : %s\n", argv[0]);
     //printf("here!\n");
     if(strcmp(argv[0], "show\n") == 0) {
+        printf("%s\n", msg);
         printTree(root, msg);
         strcpy(buf, msg);
     }
@@ -115,10 +116,13 @@ void eval(char *argv[], char buf[], int connfd) {
     }
     else if(strcmp(argv[0], "exit") == 0) {
         // Make exit function
-        FILE *fp = fopen("stock.txt", "w");
-        saveStock(fp, root);
-        fclose(fp);
         Close(connfd);
+        FD_CLR(connfd, &p->read_set);
+        // connfd = p->clientfd[i];
+        for(i=0;i<p->maxi;i++)
+            if(p->clientfd[i] == connfd)
+                break;
+        p->clientfd[i] = -1;
     }
     return;
 }
@@ -143,12 +147,12 @@ void init_stock(void) {
     }
     fclose(fp);
 }
-void stock_function(char buf[], int connfd) {
+void stock_function(char buf[], int connfd, pool *p) {
     char *argv[100];
     char cmdline[100];
     strcpy(cmdline, buf);
     parseline(cmdline, argv);
-    eval(argv, buf, connfd);
+    eval(argv, buf, connfd, p);
     return;
 }
 void init_pool(int listenfd, pool *p) {
@@ -195,8 +199,7 @@ void check_clients(pool *p) {
                 byte_cnt += n;
                 printf("Server received %d (%d total) bytes on fd %d\n",
                         n, byte_cnt, connfd);
-                printf("%s\n", buf);
-                stock_function(buf, connfd);
+                stock_function(buf, connfd, p);
                 for(j=strlen(buf);j<MAXLINE;j++)
                     buf[j]='\0';
                 Rio_writen(connfd, buf, MAXLINE);
@@ -212,10 +215,11 @@ void check_clients(pool *p) {
 }
 int main(int argc, char **argv) 
 {
-    int listenfd, connfd;
+    int listenfd, connfd, i;
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;  /* Enough space for any address */  //line:netp:echoserveri:sockaddrstorage
     static pool pool;
+    FILE *fp;   
 
     if (argc != 2) {
 	    fprintf(stderr, "usage: %s <port>\n", argv[0]);
@@ -235,5 +239,16 @@ int main(int argc, char **argv)
             add_client(connfd, &pool);
         }
         check_clients(&pool);
+        for(i=0;(i<=pool.maxi);i++) {
+            if(pool.clientfd[i] != -1)
+                break; 
+        }
+        if(i == (pool.maxi + 1)) {
+            // signal need
+            fp = fopen("stock.txt", "w");
+            saveStock(fp, root);
+            fclose(fp);
+        }   
+            
     }
 }
