@@ -1,15 +1,21 @@
+/* 
+ * echoservert_pre.c - A prethreaded concurrent echo server
+ */
+/* $begin echoservertpremain */
 #include "csapp.h"
+#define NTHREADS  4
+#define SBUFSIZE  16
 
+// Struct Area
 typedef struct {
-    int maxfd;
-    fd_set read_set;
-    fd_set ready_set;
-    int nready;
-    int maxi;
-    int clientfd[FD_SETSIZE];
-    rio_t clientrio[FD_SETSIZE];
-} pool;
-
+    int *buf;          /* Buffer array */         
+    int n;             /* Maximum number of slots */
+    int front;         /* buf[(front+1)%n] is first item */
+    int rear;          /* buf[rear%n] is last item */
+    sem_t mutex;       /* Protects accesses to buf */
+    sem_t slots;       /* Counts available slots */
+    sem_t items;       /* Counts available items */
+} sbuf_t;
 typedef struct _Stock{
     int ID;
     int left_stock;
@@ -17,114 +23,124 @@ typedef struct _Stock{
     int readcnt;
     sem_t mutex;
 } Stock;
-
 typedef struct _Tree{
     struct _Stock stock;
     struct _Tree *left;
     struct _Tree *right;
 } Tree;
 
-Tree *root;
-int show_check = 0;
-int byte_cnt = 0;
+// Declaration Area
+void sbuf_init(sbuf_t *sp, int n);
+void sbuf_deinit(sbuf_t *sp);
+void sbuf_insert(sbuf_t *sp, int item);
+int sbuf_remove(sbuf_t *sp);
+void stock_serv(int connfd);
+void *thread(void *vargp);
+static void init_stock_serv(void);
+void init_stock(void);
+void stock_function(char buf[], int connfd);
+void parseline(char *cmdline, char *argv[]);
+void eval(char *argv[], char buf[], int connfd);
+void printTree(Tree *root, char *msg);
+Tree *FindStock(int ID);
+Tree *Insert(Tree *root, int ID, int price, int left_stock);
 
-void printTree(Tree *root, char *msg) {
-    char buf[MAXLINE];
-    if(root == NULL) return;
-    sprintf(buf, "%d %d %d\n", root->stock.ID, root->stock.left_stock, root->stock.price);
-    strcat(msg, buf);
-    printTree(root->left, msg);
-    printTree(root->right, msg);
-}
-Tree *Insert(Tree *root, int ID, int price, int left_stock) {
-    if(root == NULL) {
-        root = (Tree *)malloc(sizeof(Tree));
-        root->right = root->left = NULL;
-        root->stock.ID = ID;
-        root->stock.left_stock = left_stock;
-        root->stock.price = price;
+// global variable Area
+sbuf_t sbuf; /* Shared buffer of connected descriptors */
+Tree *root;
+static sem_t mutex;
+static int byte_cnt = 0;
+
+int main(int argc, char **argv) 
+{
+    int i, listenfd, connfd;
+    socklen_t clientlen;
+    struct sockaddr_storage clientaddr;
+    pthread_t tid; 
+
+    if (argc != 2) {
+	fprintf(stderr, "usage: %s <port>\n", argv[0]);
+	exit(0);
     }
-    else {
-        if (ID < root->stock.ID)
-            root->left = Insert(root->left, ID, price, left_stock);
-        else   
-            root->right = Insert(root->right, ID, price, left_stock);
-    }
-    return root;
-}
-Tree *FindStock(int ID) {
-    Tree *curr_node = root;
-    while(1) {
-        if(curr_node->stock.ID == ID)
-            return curr_node;
-        else if(curr_node->stock.ID > ID)
-            curr_node = curr_node->left;
-        else   
-            curr_node = curr_node->right;
+    init_stock();
+    listenfd = Open_listenfd(argv[1]);
+    sbuf_init(&sbuf, SBUFSIZE); //line:conc:pre:initsbuf
+
+    for (i = 0; i < NTHREADS; i++)  /* Create worker threads */ //line:conc:pre:begincreate
+	    Pthread_create(&tid, NULL, thread, NULL);               //line:conc:pre:endcreate
+
+    while (1) { 
+        clientlen = sizeof(struct sockaddr_storage);
+	    connfd = Accept(listenfd, (SA *) &clientaddr, &clientlen);
+	    sbuf_insert(&sbuf, connfd); /* Insert connfd in buffer */
     }
 }
-void saveStock(FILE *fp, Tree *root) {
-    if(root == NULL) return;
-    fprintf(fp, "%d %d %d\n", root->stock.ID, root->stock.left_stock, root->stock.price);
-    saveStock(fp, root->left);
-    saveStock(fp, root->right);
-    return;
-}
-void parseline(char *cmdline, char *argv[]) {
-    int i = 0;
-    char *temp = strtok(cmdline," ");
-    while(temp != NULL) {
-        argv[i] = temp;
-        i++;
-        temp = strtok(NULL, " ");
-    }
-    return;
-}
-void eval(char *argv[], char buf[], int connfd, pool* p) {
-    int ID, amount, i;
-    char *msg = (char *)calloc(MAXLINE,sizeof(char));
-    Tree *curr_node;
-    //printf("argv : %s\n", argv[0]);
-    //printf("here!\n");
-    if(strcmp(argv[0], "show\n") == 0) {
-        printf("%s\n", msg);
-        printTree(root, msg);
-        strcpy(buf, msg);
-    }
-    else if(strcmp(argv[0], "sell") == 0) {
-        ID = atoi(argv[1]);
-        amount = atoi(argv[2]);
-        curr_node = FindStock(ID);
-        curr_node->stock.left_stock += amount;
-        msg = "[sell] success\n";
-        strcpy(buf, msg);
-    }
-    else if(strcmp(argv[0], "buy") == 0) {
-        ID = atoi(argv[1]);
-        amount = atoi(argv[2]);
-        curr_node = FindStock(ID);
-        if(curr_node->stock.left_stock < amount) {
-            msg = "Not enough left stock\n";
-            strcpy(buf, msg);
-            return;
-        }
-        else {
-            curr_node->stock.left_stock -= amount;
-            msg = "[buy] success\n";
-            strcpy(buf, msg);
-        }
-    }
-    else if(strcmp(argv[0], "exit") == 0) {
-        // Make exit function
+
+// function Area
+void *thread(void *vargp) 
+{  
+    Pthread_detach(pthread_self()); 
+    while (1) { 
+        int connfd = sbuf_remove(&sbuf); /* Remove connfd from buffer */ //line:conc:pre:removeconnfd
+        stock_serv(connfd);                /* Service client */
         Close(connfd);
-        FD_CLR(connfd, &p->read_set);
-        // connfd = p->clientfd[i];
-        for(i=0;i<p->maxi;i++)
-            if(p->clientfd[i] == connfd)
-                break;
-        p->clientfd[i] = -1;
     }
-    return;
+}
+int sbuf_remove(sbuf_t *sp)
+{
+    int item;
+    P(&sp->items);                          /* Wait for available item */
+    P(&sp->mutex);                          /* Lock the buffer */
+    item = sp->buf[(++sp->front)%(sp->n)];  /* Remove the item */
+    V(&sp->mutex);                          /* Unlock the buffer */
+    V(&sp->slots);                          /* Announce available slot */
+    return item;
+}
+void sbuf_insert(sbuf_t *sp, int item)
+{
+    P(&sp->slots);                          /* Wait for available slot */
+    P(&sp->mutex);                          /* Lock the buffer */
+    sp->buf[(++sp->rear)%(sp->n)] = item;   /* Insert the item */
+    V(&sp->mutex);                          /* Unlock the buffer */
+    V(&sp->items);                          /* Announce available item */
+}
+void sbuf_deinit(sbuf_t *sp)
+{
+    Free(sp->buf);
+}
+void sbuf_init(sbuf_t *sp, int n)
+{
+    sp->buf = Calloc(n, sizeof(int)); 
+    sp->n = n;                       /* Buffer holds max of n items */
+    sp->front = sp->rear = 0;        /* Empty buffer iff front == rear */
+    Sem_init(&sp->mutex, 0, 1);      /* Binary semaphore for locking */
+    Sem_init(&sp->slots, 0, n);      /* Initially, buf has n empty slots */
+    Sem_init(&sp->items, 0, 0);      /* Initially, buf has zero data items */
+}
+static void init_stock_serv(void) 
+{
+    Sem_init(&mutex, 0, 1);
+    byte_cnt = 0;
+}
+void stock_serv(int connfd) 
+{
+    int n, j;
+    char buf[MAXLINE];
+    rio_t rio;
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    Pthread_once(&once, init_stock_serv); // main thread
+    Rio_readinitb(&rio, connfd);
+    while((n = Rio_readlineb(&rio, buf, MAXLINE)) != 0) {
+        P(&mutex);
+        byte_cnt += n;
+        printf("thread %d received %d (%d total) bytes on fd %d\n",
+                (int) pthread_self(), n, byte_cnt, connfd);
+        V(&mutex);
+        stock_function(buf, connfd);
+        for(j=strlen(buf);j<MAXLINE;j++)
+            buf[j]='\0';
+        Rio_writen(connfd, buf, MAXLINE);
+    }
 }
 void init_stock(void) {
     FILE *fp;
@@ -147,108 +163,129 @@ void init_stock(void) {
     }
     fclose(fp);
 }
-void stock_function(char buf[], int connfd, pool *p) {
+Tree *Insert(Tree *root, int ID, int price, int left_stock) {
+    if(root == NULL) {
+        root = (Tree *)malloc(sizeof(Tree));
+        root->right = root->left = NULL;
+        root->stock.ID = ID;
+        root->stock.left_stock = left_stock;
+        root->stock.price = price;
+        root->stock.readcnt = 0;
+        Sem_init(&root->stock.mutex, 0, 1);
+    }
+    else {
+        if (ID < root->stock.ID)
+            root->left = Insert(root->left, ID, price, left_stock);
+        else   
+            root->right = Insert(root->right, ID, price, left_stock);
+    }
+    return root;
+}
+void stock_function(char buf[], int connfd) {
     char *argv[100];
     char cmdline[100];
     strcpy(cmdline, buf);
     parseline(cmdline, argv);
-    eval(argv, buf, connfd, p);
+    eval(argv, buf, connfd);
     return;
 }
-void init_pool(int listenfd, pool *p) {
-    int i;
-    p->maxi = -1;
-    for(i=0;i<FD_SETSIZE;i++)
+void parseline(char *cmdline, char *argv[]) {
+    int i = 0;
+    char *temp = strtok(cmdline," ");
+    while(temp != NULL) {
+        argv[i] = temp;
+        i++;
+        temp = strtok(NULL, " ");
+    }
+    return;
+}
+void eval(char *argv[], char buf[], int connfd) {
+    int ID, amount;
+    char *msg = (char *)calloc(MAXLINE,sizeof(char));
+    Tree *curr_node;
+
+    if(strcmp(argv[0], "show\n") == 0) {
+        printTree(root, msg);
+        strcpy(buf, msg);
+    }
+    else if(strcmp(argv[0], "sell") == 0) {
+        ID = atoi(argv[1]);
+        amount = atoi(argv[2]);
+        curr_node = FindStock(ID);
+        P(&curr_node->stock.mutex);
+        curr_node->stock.left_stock += amount;
+        V(&curr_node->stock.mutex);
+        msg = "[sell] success\n";
+        strcpy(buf, msg);
+    }
+    else if(strcmp(argv[0], "buy") == 0) {
+        ID = atoi(argv[1]);
+        amount = atoi(argv[2]);
+        curr_node = FindStock(ID);
+        if(curr_node->stock.left_stock < amount) {
+            msg = "Not enough left stock\n";
+            strcpy(buf, msg);
+            return;
+        }
+        else {
+            P(&curr_node->stock.mutex);
+            curr_node->stock.left_stock -= amount;
+            V(&curr_node->stock.mutex);
+            msg = "[buy] success\n";
+            strcpy(buf, msg);
+        }
+    }
+    else if(strcmp(argv[0], "exit") == 0) {
+        // Make exit function
+        Close(connfd);
+        //FD_CLR(connfd, &p->read_set);
+        // connfd = p->clientfd[i];
+        /*for(i=0;i<p->maxi;i++)
+            if(p->clientfd[i] == connfd)
+                break;
         p->clientfd[i] = -1;
-    p->maxfd = listenfd;
-    FD_ZERO(&p->read_set);
-    FD_SET(listenfd, &p->read_set);
-}
-void add_client(int connfd, pool *p) {
-    int i;
-    p->nready--;
-    for(i=0;i<FD_SETSIZE;i++) {
-        if(p->clientfd[i] < 0) {
-            p->clientfd[i] = connfd;
-            Rio_readinitb(&p->clientrio[i], connfd);
-
-            FD_SET(connfd, &p->read_set);
-
-            if(connfd > p->maxfd)
-                p->maxfd = connfd;
-            if(i > p->maxi)
-                p->maxi = i;
-            break;
-        }
+        */
     }
-    if (i == FD_SETSIZE)
-        app_error("add_client error: Too many clients");
+    return;
 }
-void check_clients(pool *p) {
-    int i, connfd, n, j;
+void printTree(Tree *root, char *msg) {
     char buf[MAXLINE];
-    rio_t rio;
-
-    for(i=0;(i<=p->maxi) && (p->nready > 0);i++) {
-        connfd = p->clientfd[i];
-        rio = p->clientrio[i];
-
-        if ((connfd > 0) && (FD_ISSET(connfd, &p->ready_set))) {
-            p->nready--;
-            if ((n = Rio_readlineb(&rio, buf, MAXLINE)) != 0) {
-                byte_cnt += n;
-                printf("Server received %d (%d total) bytes on fd %d\n",
-                        n, byte_cnt, connfd);
-                stock_function(buf, connfd, p);
-                for(j=strlen(buf);j<MAXLINE;j++)
-                    buf[j]='\0';
-                Rio_writen(connfd, buf, MAXLINE);
-                //printf("Waiting! %d\n", connfd);
-            }
-            else {
-                Close(connfd);
-                FD_CLR(connfd, &p->read_set);
-                p->clientfd[i] = -1;
-            }
-        }
-    }
+    if(root == NULL) return;
+    P(&mutex);
+    root->stock.readcnt++;
+    if(root->stock.readcnt == 1)
+        P(&root->stock.mutex);
+    V(&mutex);        
+    sprintf(buf, "%d %d %d\n", root->stock.ID, root->stock.left_stock, root->stock.price);
+    P(&mutex);
+    root->stock.readcnt--;
+    if(root->stock.readcnt == 0)
+        V(&root->stock.mutex);
+    V(&mutex);
+    strcat(msg, buf);
+    printTree(root->left, msg);
+    printTree(root->right, msg);
 }
-int main(int argc, char **argv) 
-{
-    int listenfd, connfd, i;
-    socklen_t clientlen;
-    struct sockaddr_storage clientaddr;  /* Enough space for any address */  //line:netp:echoserveri:sockaddrstorage
-    static pool pool;
-    FILE *fp;   
+Tree *FindStock(int ID) {
+    Tree *curr_node = root;
+    while(1) {
+        P(&mutex);
+        curr_node->stock.readcnt++;
+        if(curr_node->stock.readcnt == 1)
+            P(&curr_node->stock.mutex);
+        V(&mutex);
 
-    if (argc != 2) {
-	    fprintf(stderr, "usage: %s <port>\n", argv[0]);
-	    exit(0);
-    }
-    init_stock();
-    listenfd = Open_listenfd(argv[1]);
-    init_pool(listenfd, &pool);
-    while (1) {
-        pool.ready_set = pool.read_set;
-        pool.nready = Select(pool.maxfd+1, &pool.ready_set, NULL, NULL, NULL);
-        //if(FD_ISSET(STDIN_FILENO, &pool.ready_set))
-            //command();
-        if(FD_ISSET(listenfd, &pool.ready_set)) {
-            clientlen = sizeof(struct sockaddr_storage); 
-            connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
-            add_client(connfd, &pool);
-        }
-        check_clients(&pool);
-        for(i=0;(i<=pool.maxi);i++) {
-            if(pool.clientfd[i] != -1)
-                break; 
-        }
-        if(i == (pool.maxi + 1)) {
-            // signal need
-            fp = fopen("stock.txt", "w");
-            saveStock(fp, root);
-            fclose(fp);
-        }   
-            
+        if(curr_node->stock.ID == ID)
+            return curr_node;
+        else if(curr_node->stock.ID > ID)
+            curr_node = curr_node->left;
+        else   
+            curr_node = curr_node->right;
+        
+        P(&mutex);
+        curr_node->stock.readcnt--;
+        if(curr_node->stock.readcnt == 0)
+            V(&curr_node->stock.mutex);
+        V(&mutex);
     }
 }
