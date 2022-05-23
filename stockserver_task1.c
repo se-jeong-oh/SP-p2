@@ -28,6 +28,14 @@ Tree *root;
 int show_check = 0;
 int byte_cnt = 0;
 
+void saveStock(FILE *fp, Tree *root);
+
+void sigint_handler(int sig) {
+    FILE *fp = fopen("stock.txt", "w");
+    saveStock(fp, root);
+    fclose(fp);
+    exit(0);
+}
 void printTree(Tree *root, char *msg) {
     char buf[MAXLINE];
     if(root == NULL) return;
@@ -218,9 +226,8 @@ int main(int argc, char **argv)
     int listenfd, connfd, i;
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;  /* Enough space for any address */  //line:netp:echoserveri:sockaddrstorage
-    static pool pool;
-    FILE *fp;   
-
+    static pool pool;  
+    signal(SIGINT, sigint_handler);
     if (argc != 2) {
 	    fprintf(stderr, "usage: %s <port>\n", argv[0]);
 	    exit(0);
@@ -242,13 +249,6 @@ int main(int argc, char **argv)
         for(i=0;(i<=pool.maxi);i++) {
             if(pool.clientfd[i] != -1)
                 break; 
-        }
-        if(i == (pool.maxi + 1)) {
-            // signal need
-            fp = fopen("stock.txt", "w");
-            saveStock(fp, root);
-            fclose(fp);
-        }   
-            
+        }            
     }
 }
